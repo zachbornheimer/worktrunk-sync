@@ -1,7 +1,8 @@
 //! `wt sync` — rebase stacked worktree branches in dependency order.
 //!
-//! Detects the branch dependency tree from git's commit graph using pairwise
-//! merge-base analysis, then rebases each branch onto its parent in topological
+//! Detects the branch dependency tree from git's commit graph using one
+//! `rev-list --parents` dump (pairwise git only over the memory budget, or
+//! for criss-cross pairs), then rebases each branch onto its parent in topological
 //! order. All rebases use `--onto` with a stored fork-point, which correctly
 //! handles parent branches that have been rewritten (rebased, amended, or
 //! force-pushed). Integrated (merged) branches are detected and their children
@@ -21,10 +22,11 @@
 //! - `--all` syncs every worktree branch
 //! - `--dry-run` previews the plan without executing
 //! - `--push-only` pushes the stack as-is, without fetching or rebasing
+//! - `--pull` fetches and fast-forwards the root branch to its upstream first
 //! - Stops on first conflict; user resolves and re-runs
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use color_print::cformat;
@@ -148,6 +150,8 @@ impl DependencyTree {
 /// Options for the sync command.
 pub struct SyncOptions {
     pub fetch: bool,
+    /// Fast-forward root branches to their upstream before building the tree.
+    pub pull: bool,
     pub all: bool,
     pub push: bool,
     /// Push the selected branches as-is, skipping fetch and rebase.
@@ -195,6 +199,87 @@ fn save_fork_points(
     lines.sort();
     std::fs::write(&path, lines.join("\n") + "\n").context("Failed to write fork-points file")?;
     Ok(())
+}
+
+/// Pick the `--onto` base for rebasing `branch` onto `parent`, and a short
+/// reason for the choice (shown with `-v`).
+///
+/// A reparented branch always uses its integrated original parent. Otherwise
+/// the stored fork-point (the parent tip at last sync) competes with the
+/// current merge-base:
+///
+/// - stored ⊑ merge-base: the branch was rebased by hand onto a newer parent
+///   commit since the last sync. The stored value is stale; replaying from it
+///   would re-apply commits the parent already has. Use the merge-base.
+/// - merge-base ⊑ stored: the parent was rebased, so the merge-base slid back
+///   to an older ancestor. The stored fork-point is the only thing that knows
+///   where the branch's own commits start. Use it.
+/// - stored not in the branch's history, or unrelated to the merge-base:
+///   warn and fall back to the merge-base.
+fn choose_rebase_base(
+    repo: &Repository,
+    branch: &str,
+    parent: &str,
+    original_parent: Option<&str>,
+    stored_fp: Option<&str>,
+    merge_base: &str,
+) -> (String, String) {
+    if let Some(orig) = original_parent {
+        return (
+            orig.to_string(),
+            format!("using {orig}: reparented from integrated branch"),
+        );
+    }
+    let Some(fp) = stored_fp else {
+        return (
+            merge_base.to_string(),
+            "using merge-base: no stored fork-point".to_string(),
+        );
+    };
+    let is_ancestor = |a: &str, b: &str| {
+        repo.run_command_check(&["merge-base", "--is-ancestor", a, b])
+            .unwrap_or(false)
+    };
+    if !is_ancestor(fp, branch) {
+        eprintln!(
+            "{}",
+            warning_message(cformat!(
+                "Stored fork-point for <bold>{branch}</> is not in its history; using merge-base"
+            ))
+        );
+        return (
+            merge_base.to_string(),
+            "using merge-base: stored fork-point is not in the branch's history".to_string(),
+        );
+    }
+    if fp == merge_base {
+        return (
+            merge_base.to_string(),
+            "using stored fork-point (same as merge-base)".to_string(),
+        );
+    }
+    if is_ancestor(fp, merge_base) {
+        return (
+            merge_base.to_string(),
+            format!("using merge-base: stored fork-point is stale ({branch} was rebased onto a newer {parent})"),
+        );
+    }
+    if is_ancestor(merge_base, fp) {
+        return (
+            fp.to_string(),
+            format!("using stored fork-point: {parent} was rebased since last sync"),
+        );
+    }
+    eprintln!(
+        "{}",
+        warning_message(cformat!(
+            "Stored fork-point for <bold>{branch}</> is unrelated to its merge-base with <bold>{parent}</>; using merge-base"
+        ))
+    );
+    (
+        merge_base.to_string(),
+        "using merge-base: stored fork-point is unrelated to the merge-base".to_string(),
+    )
 }
 
 /// Parse a stack file (git-machete compatible format) into a parent map.
@@ -413,113 +498,32 @@ fn build_dependency_tree(
             parent_map.insert(branch.clone(), (parent, None));
         }
     } else {
-        // Infer parents from the commit graph using merge-base analysis.
-        //
-        // For each branch B, the parent P is selected in two tiers:
-        //   1. True ancestors (candidate_depth == 0, meaning merge_base ==
-        //      candidate tip): branches whose tip is reachable from B. Among
-        //      true ancestors, pick the closest (smallest branch_depth).
-        //   2. Diverged candidates (only if no true ancestors): pick by
-        //      smallest branch_depth, then smallest candidate_depth.
-        //
-        // This prevents cycles in stacked branches: if B descends from C
-        // (C's tip is on B's history), C is a true ancestor and always wins
-        // over siblings that merely share a common fork point.
-        //
         // Limitation: after syncing + adding a mid-stack commit, the parent
         // branch becomes "diverged" and may lose to the default branch (a
         // true ancestor). The auto-saved stack file (`.git/wt/stack`) avoids
         // this by preserving explicit parent relationships across syncs.
         let branch_names: Vec<&str> = branches.iter().map(|(b, _)| b.as_str()).collect();
-
-        for (branch, _) in &branches {
-            if branch == &default_branch || integrated.contains_key(branch) {
-                continue;
-            }
-
-            let mut ancestors: Vec<(&str, String, usize)> = Vec::new();
-            let mut diverged: Vec<(&str, String, usize, usize)> = Vec::new();
-
-            for candidate in &branch_names {
-                if *candidate == branch.as_str() {
-                    continue;
-                }
-
-                let Some(mb) = repo.merge_base(candidate, branch)? else {
-                    continue;
-                };
-
-                let branch_depth = repo.count_commits(&mb, branch)?;
-
-                if branch_depth == 0 {
-                    continue;
-                }
-
-                let candidate_depth = repo.count_commits(&mb, candidate)?;
-
-                if candidate_depth == 0 {
-                    ancestors.push((candidate, mb, branch_depth));
-                } else {
-                    diverged.push((candidate, mb, branch_depth, candidate_depth));
-                }
-            }
-
-            let mut best_parent: Option<&str> = None;
-            let mut tie_candidates: Vec<(&str, String)> = Vec::new();
-
-            if !ancestors.is_empty() {
-                ancestors.sort_by_key(|&(_, _, bd)| bd);
-                let best_bd = ancestors[0].2;
-                tie_candidates = ancestors
-                    .iter()
-                    .filter(|&&(_, _, bd)| bd == best_bd)
-                    .map(|&(c, ref mb, _)| (c, mb.clone()))
-                    .collect();
-                best_parent = Some(ancestors[0].0);
-            } else if !diverged.is_empty() {
-                diverged.sort_by_key(|&(_, _, bd, cd)| (bd, cd));
-                let (best_bd, best_cd) = (diverged[0].2, diverged[0].3);
-                tie_candidates = diverged
-                    .iter()
-                    .filter(|&&(_, _, bd, cd)| bd == best_bd && cd == best_cd)
-                    .map(|&(c, ref mb, _, _)| (c, mb.clone()))
-                    .collect();
-                best_parent = Some(diverged[0].0);
-            }
-
-            if tie_candidates.len() > 1 {
-                let mb_shas: Vec<&str> = tie_candidates.iter().map(|(_, mb)| mb.as_str()).collect();
-                let commits = repo.commit_details_many(&mb_shas)?;
-
-                let mut best_ts = i64::MIN;
-                let mut resolved_parent: Option<&str> = None;
-                for (candidate, mb) in &tie_candidates {
-                    if let Some(&(_, ts, _)) = commits.get(mb.as_str()) {
-                        if ts > best_ts {
-                            best_ts = ts;
-                            resolved_parent = Some(candidate);
-                        }
-                    }
-                }
-                if let Some(p) = resolved_parent {
-                    best_parent = Some(p);
-                }
-
-                let names: Vec<&str> = tie_candidates.iter().map(|(c, _)| *c).collect();
-                eprintln!(
-                    "{}",
-                    warning_message(cformat!(
-                        "Branch <bold>{}</> has equidistant parents: {}. Picked <bold>{}</>.",
-                        branch,
-                        names.join(", "),
-                        best_parent.unwrap_or("unknown"),
-                    ))
-                );
-            }
-
-            if let Some(parent) = best_parent {
-                parent_map.insert(branch.clone(), (parent.to_string(), None));
-            }
+        let skip: std::collections::HashSet<&str> = integrated.keys().map(String::as_str).collect();
+        let inferred = crate::parent_infer::infer_parents(
+            repo,
+            &branch_names,
+            &default_branch,
+            &skip,
+            crate::parent_infer::MemoryBudget::default(),
+        )?;
+        for warning in inferred.equidistant {
+            eprintln!(
+                "{}",
+                warning_message(cformat!(
+                    "Branch <bold>{}</> has equidistant parents: {}. Picked <bold>{}</>.",
+                    warning.branch,
+                    warning.candidates.join(", "),
+                    warning.picked,
+                ))
+            );
+        }
+        for (branch, parent) in inferred.parents {
+            parent_map.insert(branch, (parent, None));
         }
     }
 
@@ -642,9 +646,182 @@ fn build_dependency_tree(
     ))
 }
 
+/// A fast-forward of the root branch that `--pull` would perform (dry-run).
+struct PendingFastForward {
+    upstream: String,
+    /// Worktree where the root is checked out.
+    worktree: PathBuf,
+}
+
+/// Worktree that has `branch` checked out, if any.
+fn worktree_for_branch(repo: &Repository, branch: &str) -> anyhow::Result<Option<PathBuf>> {
+    Ok(repo
+        .list_worktrees()?
+        .iter()
+        .find(|wt| !wt.bare && !wt.detached && wt.branch.as_deref() == Some(branch))
+        .map(|wt| wt.path.clone()))
+}
+
+/// Compare the root branch with its upstream and, with `--pull`, fast-forward it.
+///
+/// Runs after the fetch and before the dependency tree is built, so the
+/// integration checks, `--prune` and every rebase see the updated root.
+/// Stacked branches are never touched here.
+///
+/// Never fails the run: a root that can't be fast-forwarded (diverged, dirty
+/// worktree, no upstream) gets a warning and the sync continues on the local
+/// ref as it always has. Without `--pull`, a root that is behind its upstream
+/// still gets a warning, so a rebase onto a stale `main` is no longer silent.
+///
+/// Returns the fast-forward that a dry run would perform, for the plan.
+fn update_root(
+    repo: &Repository,
+    root: &str,
+    worktree: &Path,
+    opts: &SyncOptions,
+) -> anyhow::Result<Option<PendingFastForward>> {
+    let Some(upstream) = repo.branch(root).upstream()? else {
+        if opts.pull {
+            eprintln!(
+                "{}",
+                warning_message(cformat!("<bold>{root}</> has no upstream; nothing to pull"))
+            );
+        }
+        return Ok(None);
+    };
+
+    let local_sha = repo.run_command(&["rev-parse", "--verify", &format!("refs/heads/{root}")])?;
+    let local_sha = local_sha.trim();
+    let upstream_sha =
+        repo.run_command(&["rev-parse", "--verify", &format!("{upstream}^{{commit}}")])?;
+    let upstream_sha = upstream_sha.trim();
+
+    if local_sha == upstream_sha {
+        if opts.pull {
+            eprintln!(
+                "{}",
+                success_message(cformat!(
+                    "<bold>{root}</> is up to date with <bold>{upstream}</>"
+                ))
+            );
+        }
+        return Ok(None);
+    }
+
+    // Only a root whose tip is an ancestor of its upstream can be
+    // fast-forwarded. Ahead-only roots have nothing to pull.
+    if !repo.is_ancestor_by_sha(local_sha, upstream_sha)? {
+        if !repo.is_ancestor_by_sha(upstream_sha, local_sha)? {
+            let ahead = repo.count_commits(upstream_sha, local_sha)?;
+            let behind = repo.count_commits(local_sha, upstream_sha)?;
+            eprintln!(
+                "{}",
+                warning_message(cformat!(
+                    "<bold>{root}</> has diverged from <bold>{upstream}</> ({ahead} ahead, {behind} behind); not fast-forwarding. Merge or rebase it manually."
+                ))
+            );
+        }
+        return Ok(None);
+    }
+
+    let behind = repo.count_commits(local_sha, upstream_sha)?;
+    let commits = if behind == 1 { "commit" } else { "commits" };
+
+    if !opts.pull {
+        eprintln!(
+            "{}",
+            warning_message(cformat!(
+                "<bold>{root}</> is {behind} {commits} behind <bold>{upstream}</>; run with --pull to update it"
+            ))
+        );
+        return Ok(None);
+    }
+
+    let short_old = repo.run_command(&["rev-parse", "--short", local_sha])?;
+    let short_new = repo.run_command(&["rev-parse", "--short", upstream_sha])?;
+    let range = format!("{}..{}", short_old.trim(), short_new.trim());
+
+    if opts.dry_run {
+        eprintln!(
+            "{}",
+            progress_message(cformat!(
+                "Would fast-forward <bold>{root}</> {range} ({behind} {commits})"
+            ))
+        );
+        eprintln!(
+            "{}",
+            hint_message(
+                "Dry run skips the fetch, so this is based on the current remote-tracking refs and may be stale."
+            )
+        );
+        return Ok(Some(PendingFastForward {
+            upstream,
+            worktree: worktree.to_path_buf(),
+        }));
+    }
+
+    match fast_forward_root(repo, &upstream, worktree) {
+        Ok(()) => eprintln!(
+            "{}",
+            success_message(cformat!(
+                "Fast-forwarded <bold>{root}</> {range} ({behind} {commits})"
+            ))
+        ),
+        Err(e) => {
+            eprintln!(
+                "{}",
+                warning_message(cformat!(
+                    "Could not fast-forward <bold>{root}</> to <bold>{upstream}</>: {e}"
+                ))
+            );
+            eprintln!(
+                "{}",
+                hint_message(cformat!(
+                    "Continuing with the local <bold>{root}</>, which is {behind} {commits} behind."
+                ))
+            );
+        }
+    }
+    Ok(None)
+}
+
+/// Fast-forward the root checked out in `worktree` to `upstream`.
+///
+/// Goes through `git merge --ff-only` in that worktree so the index and
+/// working tree follow the branch. That is only safe in a clean worktree with
+/// no operation in progress; otherwise the root is left alone. The caller has
+/// already proven this is a fast-forward.
+fn fast_forward_root(repo: &Repository, upstream: &str, worktree: &Path) -> anyhow::Result<()> {
+    let wt = repo.worktree_at(worktree);
+    if let Some(op) = wt.operation_in_progress()? {
+        let op: &'static str = op.into();
+        bail!("its worktree has a {op} in progress");
+    }
+    let status = wt.run_command(&["status", "--porcelain", "-uno"])?;
+    if !status.trim().is_empty() {
+        bail!(
+            "its worktree {} has uncommitted changes",
+            worktree.display()
+        );
+    }
+    wt.run_command(&["merge", "--ff-only", upstream])
+        .context("git merge --ff-only failed")?;
+    Ok(())
+}
+
 /// Execute the sync operation.
 pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
     let repo = Repository::current()?;
+
+    // The root must be checked out somewhere: the dependency tree needs its
+    // worktree, and `--pull` fast-forwards through it. Check up front so a
+    // run that is going to fail does so before fetching or moving any ref.
+    let default_branch = repo
+        .default_branch()
+        .context("Cannot determine default branch")?;
+    let Some(root_worktree) = worktree_for_branch(&repo, &default_branch)? else {
+        bail!("Default branch '{default_branch}' has no worktree. Cannot build dependency tree.");
+    };
 
     // Fetch from remote if requested (skip in dry-run)
     if opts.fetch && !opts.dry_run {
@@ -652,6 +829,10 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
         repo.run_command(&["fetch"]).context("git fetch failed")?;
         eprintln!("{}", success_message("Fetch complete"));
     }
+
+    // Fast-forward (or at least check) the root branch before planning, so
+    // the tree is built against the root the remote actually has.
+    let pending_ff = update_root(&repo, &default_branch, &root_worktree, &opts)?;
 
     // Build dependency tree
     let (tree, integrated) = build_dependency_tree(&repo)?;
@@ -691,7 +872,14 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
 
     // Dry-run mode: show plan and exit
     if opts.dry_run {
-        print_sync_plan(&repo, &tree, &branches_to_sync, &integrated, &opts);
+        print_sync_plan(
+            &repo,
+            &tree,
+            &branches_to_sync,
+            &integrated,
+            pending_ff.as_ref(),
+            &opts,
+        );
         return Ok(());
     }
 
@@ -791,20 +979,17 @@ pub fn handle_sync(opts: SyncOptions) -> anyhow::Result<()> {
             continue;
         }
 
-        // Determine the rebase base: use the stored fork-point (old parent tip)
-        // when available, otherwise fall back to the merge-base.
-        // The fork-point is essential when the parent was rebased — the merge-base
-        // shifts to an older ancestor, but the fork-point stays at the old parent tip.
-        let rebase_base = if let Some(ref orig_parent) = node.original_parent {
-            // Reparented branch — base is the integrated parent branch
-            orig_parent.clone()
-        } else if let Some(stored_fp) = fork_points.get(branch) {
-            // Use the stored fork-point from the previous sync
-            stored_fp.clone()
-        } else {
-            // First sync or no fork-point — fall back to merge-base
-            mb.clone()
-        };
+        let (rebase_base, reason) = choose_rebase_base(
+            &repo,
+            branch,
+            parent,
+            node.original_parent.as_deref(),
+            fork_points.get(branch).map(String::as_str),
+            &mb,
+        );
+        if opts.verbose {
+            eprintln!("{}", hint_message(reason));
+        }
 
         eprintln!(
             "{}",
@@ -1025,11 +1210,18 @@ fn print_sync_plan(
     tree: &DependencyTree,
     branches: &[&str],
     integrated: &[IntegratedBranch],
+    pending_ff: Option<&PendingFastForward>,
     opts: &SyncOptions,
 ) {
     if opts.verbose && opts.fetch {
         eprintln!("Fetch:");
         eprintln!("    $ git fetch");
+        if let Some(PendingFastForward { upstream, worktree }) = pending_ff {
+            eprintln!(
+                "    $ git -C {} merge --ff-only {upstream}",
+                worktree.to_string_lossy()
+            );
+        }
         eprintln!();
     }
 
@@ -1054,7 +1246,8 @@ fn print_sync_plan(
     }
 
     let fork_points = load_fork_points(repo);
-    let mut has_ops = false;
+    let mut printed = false;
+    let mut has_rebases = false;
     for &branch in branches {
         let Some(node) = tree.nodes.get(branch) else {
             continue;
@@ -1063,27 +1256,56 @@ fn print_sync_plan(
             continue;
         };
 
+        // Same up-to-date check as the real run, against the parent's current
+        // tip. With a pending `--pull` fast-forward the real run moves the root
+        // first, so plan the root's children against the upstream tip it would
+        // move to rather than the stale local ref.
+        let parent_rev: &str = match pending_ff {
+            Some(ff) if parent == &tree.root => ff.upstream.as_str(),
+            _ => parent.as_str(),
+        };
+        let Ok(Some(mb)) = repo.merge_base(parent_rev, branch) else {
+            continue;
+        };
+        let parent_sha = repo
+            .run_command(&["rev-parse", parent_rev])
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        if mb == parent_sha {
+            eprintln!("  {branch} is up to date with {parent}");
+            printed = true;
+            continue;
+        }
+
+        let (base, reason) = choose_rebase_base(
+            repo,
+            branch,
+            parent,
+            node.original_parent.as_deref(),
+            fork_points.get(branch).map(String::as_str),
+            &mb,
+        );
         if let Some(ref orig_parent) = node.original_parent {
             eprintln!(
-                "  rebase --onto {parent} {orig_parent} {branch}  (reparented from integrated {orig_parent})"
+                "  rebase {branch} onto {parent}  (reparented from integrated {orig_parent})"
             );
-            if opts.verbose {
-                eprintln!("    $ git rebase --onto {parent} {orig_parent} {branch}");
-            }
         } else {
             eprintln!("  rebase {branch} onto {parent}");
-            if opts.verbose {
-                let base = fork_points
-                    .get(branch)
-                    .map(|s| s.as_str())
-                    .unwrap_or("<merge-base>");
-                eprintln!("    $ git rebase --onto {parent} {base} {branch}");
-            }
         }
-        has_ops = true;
+        if opts.verbose {
+            eprintln!("    $ git rebase --onto {parent} {base} {branch}");
+            eprintln!("    # {reason}");
+        }
+        printed = true;
+        has_rebases = true;
     }
-    if !has_ops {
+    if !printed {
         eprintln!("  (none)");
+    } else if has_rebases {
+        eprintln!();
+        eprintln!(
+            "Note: branches whose parent is rebased earlier in the same run are shown against the parent's current tip; the real run recomputes them after the parent moves."
+        );
     }
 
     if opts.verbose {
